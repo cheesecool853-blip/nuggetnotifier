@@ -1,41 +1,93 @@
+// Nugget Notifier - WebSocket + HTTP backend
 const WebSocket = require('ws');
 const http = require('http');
 
 const PORT = process.env.PORT || 8080;
 
-// In-memory store: jobId -> { place_id, player_count, player_list, updated }
+// jobId -> { place_id, player_count, player_list, updated }
 const servers = {};
+const STALE_MS = 3 * 60 * 1000; // drop servers with no updates for 3 minutes
 
-// Clean up stale entries after 3 minutes of no updates
-const STALE_MS = 3 * 60 * 1000;
+// Cleanup loop
 setInterval(() => {
   const now = Date.now();
   for (const id in servers) {
     if (now - servers[id].updated > STALE_MS) {
       delete servers[id];
+      console.log(`[cleanup] removed stale ${id}`);
     }
   }
 }, 30000);
 
+// ---------- HTTP server ----------
 const server = http.createServer((req, res) => {
-  // Simple HTTP health check / snapshot endpoint
-  if (req.url === '/health') {
+  // CORS
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
+  // Health check
+  if (req.url.startsWith('/health')) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ ok: true, count: Object.keys(servers).length }));
     return;
   }
-  if (req.url === '/servers') {
+
+  // Snapshot for UI HTTP fallback + debugging
+  if (req.url.startsWith('/servers') && req.method === 'GET') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(servers));
     return;
   }
+
+  // HTTP feeder fallback
+  if (req.url.startsWith('/log') && req.method === 'POST') {
+    let body = '';
+    req.on('data', (chunk) => { body += chunk; });
+    req.on('end', () => {
+      try {
+        const data = JSON.parse(body);
+        const jobId = data.job_id;
+        if (!jobId) {
+          res.writeHead(400);
+          res.end('{"error":"missing job_id"}');
+          return;
+        }
+
+        const entry = {
+          place_id: data.place_id || null,
+          player_count: data.players || '0/0',
+          player_list: data.player_list || 'None',
+          updated: Date.now(),
+        };
+
+        servers[jobId] = entry;
+        console.log(`[http] ${jobId} -> ${entry.player_count}`);
+
+        broadcast({ [jobId]: entry });
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end('{"ok":true}');
+      } catch (e) {
+        res.writeHead(400);
+        res.end('{"error":"bad json"}');
+      }
+    });
+    return;
+  }
+
   res.writeHead(404);
   res.end('Not found');
 });
 
+// ---------- WebSocket server ----------
 const wss = new WebSocket.Server({ server });
-
-// Track UI clients so we can broadcast to them
 const uiClients = new Set();
 
 function broadcast(payload) {
@@ -69,33 +121,23 @@ wss.on('connection', (ws, req) => {
         place_id: data.place_id || null,
         player_count: data.players || '0/0',
         player_list: data.player_list || 'None',
-        updated: Date.now()
+        updated: Date.now(),
       };
 
       servers[jobId] = entry;
       console.log(`[feeder] ${jobId} -> ${entry.player_count}`);
 
-      // Broadcast to all UI clients
       broadcast({ [jobId]: entry });
     });
 
     ws.on('close', () => console.log('[feeder] disconnected'));
   } else {
-    // UI client
     uiClients.add(ws);
 
-    // Send current snapshot immediately
+    // Send current snapshot on connect
     ws.send(JSON.stringify(servers));
 
-    ws.on('message', (raw) => {
-      // Allow UI to request a fresh snapshot
-      try {
-        const msg = JSON.parse(raw.toString());
-        if (msg.type === 'refresh') {
-          ws.send(JSON.stringify(servers));
-        }
-      } catch (_) {}
-    });
+    ws.on('message', () => { /* ignore client pings */ });
 
     ws.on('close', () => {
       uiClients.delete(ws);
@@ -103,12 +145,12 @@ wss.on('connection', (ws, req) => {
     });
   }
 
-  // Keepalive ping every 25s
+  // Keepalive
   ws.isAlive = true;
   ws.on('pong', () => { ws.isAlive = true; });
 });
 
-// Ping loop to kill dead connections
+// Kill dead connections
 setInterval(() => {
   wss.clients.forEach((ws) => {
     if (ws.isAlive === false) return ws.terminate();
@@ -117,6 +159,7 @@ setInterval(() => {
   });
 }, 25000);
 
+// ---------- Start ----------
 server.listen(PORT, () => {
   console.log(`Nugget Notifier backend listening on ${PORT}`);
 });
