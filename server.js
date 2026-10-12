@@ -4,9 +4,9 @@ const http = require('http');
 
 const PORT = process.env.PORT || 8080;
 
-// jobId -> { place_id, player_count, player_list, updated }
+// jobId -> { place_id, player_count, rares: [], player_list, updated }
 const servers = {};
-const STALE_MS = 3 * 60 * 1000; // drop servers with no updates for 3 minutes
+const STALE_MS = 3 * 60 * 1000;
 
 // Cleanup loop
 setInterval(() => {
@@ -18,6 +18,42 @@ setInterval(() => {
     }
   }
 }, 30000);
+
+// ---------- Helpers ----------
+function buildEntry(data) {
+  // Accept either structured rares array OR legacy player_list string
+  let rares = [];
+  if (Array.isArray(data.rares)) {
+    rares = data.rares
+      .filter(r => r && typeof r === 'object')
+      .map(r => ({
+        name:      String(r.name     || '').slice(0, 100),
+        mutation:  String(r.mutation || 'None').slice(0, 40),
+        genValue:  Number(r.genValue) || 0,
+        genText:   String(r.genText  || '').slice(0, 40),
+        owner:     String(r.owner    || '').slice(0, 40),
+        plot:      String(r.plot     || '').slice(0, 40),
+        slot:      String(r.slot     || '').slice(0, 20),
+      }));
+  }
+
+  return {
+    place_id:     data.place_id || null,
+    player_count: data.players || '0/0',
+    rares:        rares,
+    player_list:  data.player_list || '',   // kept for legacy UIs
+    updated:      Date.now(),
+  };
+}
+
+function broadcast(payload) {
+  const msg = JSON.stringify(payload);
+  for (const c of uiClients) {
+    if (c.readyState === WebSocket.OPEN) {
+      c.send(msg);
+    }
+  }
+}
 
 // ---------- HTTP server ----------
 const server = http.createServer((req, res) => {
@@ -60,16 +96,9 @@ const server = http.createServer((req, res) => {
           return;
         }
 
-        const entry = {
-          place_id: data.place_id || null,
-          player_count: data.players || '0/0',
-          player_list: data.player_list || 'None',
-          updated: Date.now(),
-        };
-
+        const entry = buildEntry(data);
         servers[jobId] = entry;
-        console.log(`[http] ${jobId} -> ${entry.player_count}`);
-
+        console.log(`[http] ${jobId} -> ${entry.player_count} (${entry.rares.length} rares)`);
         broadcast({ [jobId]: entry });
 
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -90,15 +119,6 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocket.Server({ server });
 const uiClients = new Set();
 
-function broadcast(payload) {
-  const msg = JSON.stringify(payload);
-  for (const c of uiClients) {
-    if (c.readyState === WebSocket.OPEN) {
-      c.send(msg);
-    }
-  }
-}
-
 wss.on('connection', (ws, req) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const role = url.searchParams.get('role') || 'client';
@@ -117,24 +137,15 @@ wss.on('connection', (ws, req) => {
       const jobId = data.job_id;
       if (!jobId) return;
 
-      const entry = {
-        place_id: data.place_id || null,
-        player_count: data.players || '0/0',
-        player_list: data.player_list || 'None',
-        updated: Date.now(),
-      };
-
+      const entry = buildEntry(data);
       servers[jobId] = entry;
-      console.log(`[feeder] ${jobId} -> ${entry.player_count}`);
-
+      console.log(`[feeder] ${jobId} -> ${entry.player_count} (${entry.rares.length} rares)`);
       broadcast({ [jobId]: entry });
     });
 
     ws.on('close', () => console.log('[feeder] disconnected'));
   } else {
     uiClients.add(ws);
-
-    // Send current snapshot on connect
     ws.send(JSON.stringify(servers));
 
     ws.on('message', () => { /* ignore client pings */ });
@@ -145,7 +156,6 @@ wss.on('connection', (ws, req) => {
     });
   }
 
-  // Keepalive
   ws.isAlive = true;
   ws.on('pong', () => { ws.isAlive = true; });
 });
